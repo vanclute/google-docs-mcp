@@ -682,6 +682,147 @@ def _render_comment_with_anchor_text(comment: str, anchor_text: str) -> str:
 # Core operations
 # ---------------------------------------------------------------------------
 
+class DocumentChangedError(RuntimeError):
+    """
+    Raised when a document was modified between the read that produced the
+    indices and the write that used them. The edit was rejected, not applied.
+    """
+
+
+def _require_revision_id(doc: dict) -> str:
+    """
+    Pull the revisionId out of a documents().get() response.
+
+    Every index-computing mutator needs this: without it the write cannot
+    assert that the document is unchanged, and a concurrent edit would land at
+    stale indices and silently corrupt text.
+    """
+    revision_id = doc.get("revisionId")
+    if not revision_id:
+        raise ValueError(
+            "Document response carried no revisionId, so the edit cannot be "
+            "guarded against concurrent changes. Refusing to write."
+        )
+    return revision_id
+
+
+def _is_revision_conflict(exc: Exception) -> bool:
+    """Recognise the 400 the Docs API returns when requiredRevisionId is stale."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "resp", None), "status", None)
+    if status != 400:
+        return False
+    return "revision" in str(exc).lower()
+
+
+def _batch_update(service, doc_id: str, requests: list[dict], revision_id: str):
+    """
+    Apply requests, asserting the document is still at `revision_id`.
+
+    Uses requiredRevisionId (strict reject) rather than targetRevisionId, which
+    would attempt to transform the edit onto newer content.
+    """
+    body = {
+        "requests": requests,
+        "writeControl": {"requiredRevisionId": revision_id},
+    }
+    try:
+        return service.documents().batchUpdate(
+            documentId=doc_id,
+            body=body,
+        ).execute()
+    except Exception as exc:
+        if _is_revision_conflict(exc):
+            raise DocumentChangedError(
+                "The document changed after it was read (revision "
+                f"{revision_id} is no longer current), so the edit was NOT "
+                "applied. Re-read the document and retry."
+            ) from exc
+        raise
+
+
+def _doc_range(ft_start: int, ft_end: int, text_map) -> tuple[int, int]:
+    """Map a [start, end) full-text span to a [start, end) document range."""
+    return (
+        _full_text_pos_to_doc_index(ft_start, text_map),
+        _full_text_pos_to_doc_index(ft_end - 1, text_map) + 1,
+    )
+
+
+def _build_replacement_requests(changes: list[tuple[int, int, str]]) -> list[dict]:
+    """
+    Build batchUpdate requests for a set of (doc_start, doc_end, replacement).
+
+    Requests are emitted in DESCENDING document order. batchUpdate applies
+    requests sequentially, each seeing the effects of the previous ones, so
+    rewriting the last range first leaves every earlier offset untouched.
+    Within one replacement the insert precedes the delete, and the delete range
+    is shifted by the length of the text just inserted.
+    """
+    requests = []
+    for doc_start, doc_end, replace_text in sorted(changes, key=lambda c: c[0], reverse=True):
+        if replace_text:
+            requests.append({
+                "insertText": {
+                    "location": {"index": doc_start},
+                    "text": replace_text,
+                }
+            })
+            requests.append({
+                "deleteContentRange": {
+                    "range": {
+                        "startIndex": doc_start + len(replace_text),
+                        "endIndex": doc_end + len(replace_text),
+                    }
+                }
+            })
+        else:
+            requests.append({
+                "deleteContentRange": {
+                    "range": {"startIndex": doc_start, "endIndex": doc_end}
+                }
+            })
+    return requests
+
+
+def find_matches(
+    full_text: str,
+    find: str,
+    regex: bool = False,
+) -> list[tuple[int, int]]:
+    """
+    Locate every match of `find` in `full_text`.
+
+    Pure function (no network, no Docs API) so that occurrence numbering can be
+    tested directly. Returns a list of (start, end) offsets into `full_text`,
+    in ascending order, where `end` is exclusive.
+    """
+    if not find:
+        raise ValueError("Search text must not be empty.")
+
+    if regex:
+        matches = [(m.start(), m.end()) for m in re.finditer(find, full_text)]
+        if any(start == end for start, end in matches):
+            raise ValueError(
+                f"Pattern {find!r} matches an empty string, which cannot be "
+                "mapped to a document range."
+            )
+        return matches
+
+    matches = []
+    search_from = 0
+    while True:
+        pos = full_text.find(find, search_from)
+        if pos == -1:
+            break
+        matches.append((pos, pos + len(find)))
+        # Advance past the whole match: `pos + 1` would report overlapping
+        # matches ("aa" in "aaaa" at 0, 1, 2) and corrupt occurrence numbering.
+        search_from = pos + len(find)
+    return matches
+
+
 def get(doc_id: str) -> dict:
     """
     Fetch a Google Doc and return structured representation.
@@ -755,26 +896,36 @@ def search_replace(
         )
         return {"ok": True, "replaced": find, "occurrences_changed": count}
 
-    # Targeted occurrence: find index manually
+    # Anything else (a targeted occurrence, or a regex replace-all, which the
+    # native replaceAllText API cannot express) needs indices computed here.
     doc = _get_document(service, doc_id)
+    revision_id = _require_revision_id(doc)
     paragraphs = _extract_paragraphs(doc)
     full_text, text_map = _build_full_text_map(paragraphs)
 
-    # Build list of (ft_start, ft_end) tuples
-    if regex:
-        matches = [(m.start(), m.end()) for m in re.finditer(find, full_text)]
-    else:
-        matches = []
-        search_from = 0
-        while True:
-            pos = full_text.find(find, search_from)
-            if pos == -1:
-                break
-            matches.append((pos, pos + len(find)))
-            search_from = pos + 1
+    matches = find_matches(full_text, find, regex=regex)
 
     if not matches:
         raise ValueError(f"Text not found in document: {find!r}")
+
+    if occurrence == 0:
+        # Regex replace-all: rewrite every match in one batch.
+        changes = [
+            _doc_range(ft_start, ft_end, text_map) + (replace,)
+            for ft_start, ft_end in matches
+        ]
+        _batch_update(service, doc_id, _build_replacement_requests(changes), revision_id)
+        return {
+            "ok": True,
+            "replaced": find,
+            "occurrences_changed": len(matches),
+            "occurrences_found": len(matches),
+        }
+
+    if occurrence < 0:
+        raise ValueError(
+            f"occurrence must be 0 (all) or a positive 1-based index, got {occurrence}"
+        )
 
     target_idx = occurrence - 1
     if target_idx >= len(matches):
@@ -783,41 +934,11 @@ def search_replace(
         )
 
     ft_start, ft_end = matches[target_idx]
-
-    doc_start = _full_text_pos_to_doc_index(ft_start, text_map)
-    doc_end = _full_text_pos_to_doc_index(ft_end - 1, text_map) + 1
-
+    doc_start, doc_end = _doc_range(ft_start, ft_end, text_map)
     old_text = full_text[ft_start:ft_end]
 
-    # Apply: delete old text, then insert replacement at same position
-    requests = []
-    if replace:
-        requests.append({
-            "insertText": {
-                "location": {"index": doc_start},
-                "text": replace,
-            }
-        })
-        requests.append({
-            "deleteContentRange": {
-                "range": {
-                    "startIndex": doc_start + len(replace),
-                    "endIndex": doc_end + len(replace),
-                }
-            }
-        })
-    else:
-        # Replacing with empty string = pure delete
-        requests.append({
-            "deleteContentRange": {
-                "range": {"startIndex": doc_start, "endIndex": doc_end}
-            }
-        })
-
-    service.documents().batchUpdate(
-        documentId=doc_id,
-        body={"requests": requests},
-    ).execute()
+    requests = _build_replacement_requests([(doc_start, doc_end, replace)])
+    _batch_update(service, doc_id, requests, revision_id)
 
     return {
         "ok": True,
@@ -835,6 +956,7 @@ def insert_after(doc_id: str, anchor: str, text: str, rich: bool = True) -> dict
     """
     service = _get_service("docs", "v1")
     doc = _get_document(service, doc_id)
+    revision_id = _require_revision_id(doc)
     paragraphs = _extract_paragraphs(doc)
 
     target = None
@@ -855,10 +977,7 @@ def insert_after(doc_id: str, anchor: str, text: str, rich: bool = True) -> dict
         prefix="\n",
         rich=rich,
     )
-    service.documents().batchUpdate(
-        documentId=doc_id,
-        body={"requests": requests},
-    ).execute()
+    _batch_update(service, doc_id, requests, revision_id)
 
     return {
         "ok": True,
@@ -875,6 +994,7 @@ def insert_before(doc_id: str, anchor: str, text: str, rich: bool = True) -> dic
     """
     service = _get_service("docs", "v1")
     doc = _get_document(service, doc_id)
+    revision_id = _require_revision_id(doc)
     paragraphs = _extract_paragraphs(doc)
 
     target = None
@@ -895,10 +1015,7 @@ def insert_before(doc_id: str, anchor: str, text: str, rich: bool = True) -> dic
         suffix="\n",
         rich=rich,
     )
-    service.documents().batchUpdate(
-        documentId=doc_id,
-        body={"requests": requests},
-    ).execute()
+    _batch_update(service, doc_id, requests, revision_id)
 
     return {
         "ok": True,
@@ -918,6 +1035,7 @@ def delete_paragraph(doc_id: str, anchor: str) -> dict:
     """
     service = _get_service("docs", "v1")
     doc = _get_document(service, doc_id)
+    revision_id = _require_revision_id(doc)
     paragraphs = _extract_paragraphs(doc)
 
     targets = [p for p in paragraphs if anchor.lower() in p.text.lower()]
@@ -938,10 +1056,7 @@ def delete_paragraph(doc_id: str, anchor: str) -> dict:
             }
         })
 
-    service.documents().batchUpdate(
-        documentId=doc_id,
-        body={"requests": requests},
-    ).execute()
+    _batch_update(service, doc_id, requests, revision_id)
 
     return {
         "ok": True,
@@ -956,6 +1071,7 @@ def append(doc_id: str, text: str, rich: bool = True) -> dict:
     """
     service = _get_service("docs", "v1")
     doc = _get_document(service, doc_id)
+    revision_id = _require_revision_id(doc)
 
     # Find the last content index (end of the body, before the body's closing)
     body_content = doc.get("body", {}).get("content", [])
@@ -973,10 +1089,7 @@ def append(doc_id: str, text: str, rich: bool = True) -> dict:
         prefix="\n",
         rich=rich,
     )
-    service.documents().batchUpdate(
-        documentId=doc_id,
-        body={"requests": requests},
-    ).execute()
+    _batch_update(service, doc_id, requests, revision_id)
 
     return {
         "ok": True,
@@ -1004,6 +1117,7 @@ def batch_replace(doc_id: str, replacements: list[dict]) -> dict:
     """
     service = _get_service("docs", "v1")
     doc = _get_document(service, doc_id)
+    revision_id = _require_revision_id(doc)
     paragraphs = _extract_paragraphs(doc)
     full_text, text_map = _build_full_text_map(paragraphs)
 
@@ -1016,17 +1130,7 @@ def batch_replace(doc_id: str, replacements: list[dict]) -> dict:
         is_regex = rep.get("regex", False)
 
         # Build list of (ft_start, ft_end) tuples
-        if is_regex:
-            matches = [(m.start(), m.end()) for m in re.finditer(find, full_text)]
-        else:
-            matches = []
-            search_from = 0
-            while True:
-                pos = full_text.find(find, search_from)
-                if pos == -1:
-                    break
-                matches.append((pos, pos + len(find)))
-                search_from = pos + 1
+        matches = find_matches(full_text, find, regex=is_regex)
 
         if not matches:
             raise ValueError(f"Text not found: {find!r}")
@@ -1034,50 +1138,25 @@ def batch_replace(doc_id: str, replacements: list[dict]) -> dict:
         if occurrence == 0:
             # Replace all
             for ft_start, ft_end in matches:
-                ds = _full_text_pos_to_doc_index(ft_start, text_map)
-                de = _full_text_pos_to_doc_index(ft_end - 1, text_map) + 1
+                ds, de = _doc_range(ft_start, ft_end, text_map)
                 changes.append((ds, de, replace_text, full_text[ft_start:ft_end]))
         else:
+            if occurrence < 0:
+                raise ValueError(
+                    f"occurrence must be 0 (all) or a positive 1-based index, "
+                    f"got {occurrence} for {find!r}"
+                )
             idx = occurrence - 1
             if idx >= len(matches):
                 raise ValueError(f"Occurrence {occurrence} not found for {find!r}")
             ft_start, ft_end = matches[idx]
-            ds = _full_text_pos_to_doc_index(ft_start, text_map)
-            de = _full_text_pos_to_doc_index(ft_end - 1, text_map) + 1
+            ds, de = _doc_range(ft_start, ft_end, text_map)
             changes.append((ds, de, replace_text, full_text[ft_start:ft_end]))
 
-    # Sort by doc_start DESCENDING (apply end-of-doc first so indices stay valid)
-    changes.sort(key=lambda c: c[0], reverse=True)
-
-    # Build batchUpdate requests
-    requests = []
-    for (ds, de, replace_text, old_text) in changes:
-        if replace_text:
-            requests.append({
-                "insertText": {
-                    "location": {"index": ds},
-                    "text": replace_text,
-                }
-            })
-            requests.append({
-                "deleteContentRange": {
-                    "range": {
-                        "startIndex": ds + len(replace_text),
-                        "endIndex": de + len(replace_text),
-                    }
-                }
-            })
-        else:
-            requests.append({
-                "deleteContentRange": {
-                    "range": {"startIndex": ds, "endIndex": de}
-                }
-            })
-
-    service.documents().batchUpdate(
-        documentId=doc_id,
-        body={"requests": requests},
-    ).execute()
+    requests = _build_replacement_requests(
+        [(ds, de, replace_text) for (ds, de, replace_text, _old) in changes]
+    )
+    _batch_update(service, doc_id, requests, revision_id)
 
     return {
         "ok": True,
