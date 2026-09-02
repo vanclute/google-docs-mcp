@@ -37,21 +37,35 @@ from pathlib import Path
 DEFAULT_TOKEN_PATH = Path.home() / ".google-docs-mcp" / "token.json"
 
 SCOPES = [
-    # Core
+    # Core: read and write the content of Google Docs.
     "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/drive",
+    # Search and read Drive metadata. Powers docs_list.
     "https://www.googleapis.com/auth/drive.readonly",
-    # Comments
+    # Per-file Drive access, for comments on files this tool created.
     "https://www.googleapis.com/auth/drive.file",
-    # Apps Script (required for inline-anchored comments)
-    "https://www.googleapis.com/auth/script.projects",
-    "https://www.googleapis.com/auth/script.deployments",
-    "https://www.googleapis.com/auth/script.processes",
     # Identity
     "openid",
     "email",
     "profile",
 ]
+
+# Deliberately NOT requested:
+#
+#   .../auth/drive             full read AND WRITE access to every file in Drive.
+#                              Editing document text needs `documents`, not this.
+#   .../auth/script.projects   create Apps Script projects
+#   .../auth/script.deployments deploy Apps Script
+#   .../auth/script.processes  view script executions
+#
+# The three script scopes exist only for the opt-in bookmark-jump comment
+# bridge, which stays dormant unless GOOGLE_DOCS_MCP_APPS_SCRIPT_ID is set.
+# Together they permit creating and running arbitrary code as you inside your
+# own Google account, which is far more authority than a document editor needs.
+#
+# If you later need to add comments to documents this tool did NOT create,
+# re-add "https://www.googleapis.com/auth/drive" and re-run this script: the
+# Drive comments API cannot reach arbitrary pre-existing files under
+# drive.file alone.
 
 REDIRECT_PORT = 14399
 REDIRECT_URI = f"http://127.0.0.1:{REDIRECT_PORT}/oauth2/callback"
