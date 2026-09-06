@@ -148,3 +148,58 @@ def test_batch_replace_reaches_table_cells(service):
         if "insertText" in r
     ]
     assert indices == sorted(indices, reverse=True)
+
+
+def test_deleting_a_cells_last_paragraph_spares_the_terminating_newline(service):
+    # A cell with two paragraphs: deleting the second must not take the newline
+    # that terminates the cell, or the API rejects the whole batch.
+    svc = service(before=[], table=[["first para", "other cell"]], after=[])
+    doc = svc.doc
+    cell = doc["body"]["content"][0]["table"]["tableRows"][0]["tableCells"][0]
+    extra_start = cell["content"][0]["endIndex"]
+    run = "second para\n"
+    cell["content"].append({
+        "startIndex": extra_start,
+        "endIndex": extra_start + len(run),
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [{
+                "startIndex": extra_start,
+                "endIndex": extra_start + len(run),
+                "textRun": {"content": run},
+            }],
+        },
+    })
+
+    docs_edit.delete_paragraph(DOC_ID, anchor="second para")
+
+    rng = svc.last_requests[0]["deleteContentRange"]["range"]
+    assert rng["startIndex"] == extra_start - 1
+    assert rng["endIndex"] == extra_start + len(run) - 1
+
+
+def test_deleting_a_cells_first_paragraph_uses_the_plain_range(service):
+    svc = service(before=[], table=[["first para", "other cell"]], after=[])
+    doc = svc.doc
+    cell = doc["body"]["content"][0]["table"]["tableRows"][0]["tableCells"][0]
+    first = cell["content"][0]
+    extra_start = first["endIndex"]
+    run = "second para\n"
+    cell["content"].append({
+        "startIndex": extra_start,
+        "endIndex": extra_start + len(run),
+        "paragraph": {
+            "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+            "elements": [{
+                "startIndex": extra_start,
+                "endIndex": extra_start + len(run),
+                "textRun": {"content": run},
+            }],
+        },
+    })
+
+    docs_edit.delete_paragraph(DOC_ID, anchor="first para")
+
+    rng = svc.last_requests[0]["deleteContentRange"]["range"]
+    assert rng["startIndex"] == first["startIndex"]
+    assert rng["endIndex"] == first["endIndex"]

@@ -1115,13 +1115,27 @@ def delete_paragraph(doc_id: str, anchor: str) -> dict:
     # Sort by start index descending so deleting earlier content doesn't shift later indices
     targets.sort(key=lambda p: p.start, reverse=True)
 
+    # The final paragraph of a cell owns the newline that terminates the cell,
+    # and that newline cannot be deleted. For those, remove the preceding
+    # newline and this paragraph's text instead, which leaves the cell intact.
+    last_in_cell = {}
+    for p in paragraphs:
+        if p.container is None:
+            continue
+        current = last_in_cell.get(p.container)
+        if current is None or p.start > current.start:
+            last_in_cell[p.container] = p
+
     requests = []
     for t in targets:
+        start, end = t.start, t.end
+        if t.container is not None and last_in_cell[t.container] is t:
+            start, end = t.start - 1, t.end - 1
         requests.append({
             "deleteContentRange": {
                 "range": {
-                    "startIndex": t.start,
-                    "endIndex": t.end,
+                    "startIndex": start,
+                    "endIndex": end,
                 }
             }
         })
