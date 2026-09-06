@@ -44,6 +44,65 @@ def build_doc(paragraphs: list[str], revision_id: str = DEFAULT_REVISION) -> dic
     }
 
 
+def build_doc_with_table(
+    before: list[str],
+    table: list[list[str]],
+    after: list[str],
+    revision_id: str = DEFAULT_REVISION,
+) -> dict:
+    """
+    Build a document with a table between two runs of body paragraphs.
+
+    Cell paragraphs carry real document indices, exactly as the API returns
+    them, so index arithmetic in the code under test is exercised for real.
+    """
+    content = []
+    index = 1
+
+    def paragraph(text):
+        nonlocal index
+        run = text + "\n"
+        start, end = index, index + len(run)
+        index = end
+        return {
+            "startIndex": start,
+            "endIndex": end,
+            "paragraph": {
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "elements": [{
+                    "startIndex": start,
+                    "endIndex": end,
+                    "textRun": {"content": run},
+                }],
+            },
+        }
+
+    for text in before:
+        content.append(paragraph(text))
+
+    table_start = index
+    rows = []
+    for row in table:
+        cells = []
+        for cell_text in row:
+            cells.append({"content": [paragraph(cell_text)]})
+        rows.append({"tableCells": cells})
+    content.append({
+        "startIndex": table_start,
+        "endIndex": index,
+        "table": {"rows": len(table), "columns": len(table[0]), "tableRows": rows},
+    })
+
+    for text in after:
+        content.append(paragraph(text))
+
+    return {
+        "title": "Fake Doc With Table",
+        "revisionId": revision_id,
+        "body": {"content": content},
+    }
+
+
 def doc_buffer(paragraphs: list[str]) -> str:
     """
     Plain-text model of the same document, aligned to Docs indices.
