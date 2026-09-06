@@ -34,6 +34,30 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+
+def _force_utf8_output() -> None:
+    """
+    Make stdout/stderr able to carry this script's non-ASCII output.
+
+    Windows consoles default to a legacy code page (cp1252 on most machines),
+    which cannot encode the check marks and arrows used below. Without this, a
+    successful authorisation dies with UnicodeEncodeError while printing its
+    success message — after the token has already been written, so the run
+    looks like a failure when it actually worked.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            # Redirected or already-detached streams; printing still works.
+            pass
+
+
+_force_utf8_output()
+
 DEFAULT_TOKEN_PATH = Path.home() / ".google-docs-mcp" / "token.json"
 
 SCOPES = [
