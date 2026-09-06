@@ -376,6 +376,9 @@ class Paragraph:
     start: int   # Start of paragraph including leading newline-like element
     end: int     # End of paragraph (exclusive)
     runs: list[TextRun]
+    # None for body text; an opaque id identifying the table cell otherwise.
+    # Ranges may never cross from one container into another.
+    container: Optional[str] = None
 
 
 @dataclass
@@ -394,60 +397,94 @@ class RichParagraph:
     inline_styles: list[InlineStyleSpan] = field(default_factory=list)
 
 
-def _extract_paragraphs(doc: dict) -> list[Paragraph]:
-    """Extract paragraphs with full structure from a Docs API response."""
+def _paragraph_from_element(elem: dict, container: Optional[str]) -> Paragraph:
+    """Build a Paragraph from one structural element containing a paragraph."""
+    para = elem["paragraph"]
+    style = para.get("paragraphStyle", {}).get("namedStyleType", "NORMAL_TEXT")
+    runs = []
+    full_text = ""
+    for pe in para.get("elements", []):
+        if "textRun" in pe:
+            content = pe["textRun"]["content"]
+            runs.append(TextRun(
+                text=content,
+                start=pe["startIndex"],
+                end=pe["endIndex"],
+            ))
+            full_text += content
+    # Strip trailing newline for display (Google Docs always ends paragraphs with \n)
+    return Paragraph(
+        text=full_text.rstrip("\n"),
+        style=style,
+        start=elem["startIndex"],
+        end=elem["endIndex"],
+        runs=runs,
+        container=container,
+    )
+
+
+def _extract_from_content(content: list[dict], container: Optional[str]) -> list[Paragraph]:
+    """
+    Walk structural elements in document order, descending into table cells.
+
+    Table cell text carries ordinary document indices, so index arithmetic works
+    inside a cell exactly as it does in the body. What differs is that a range
+    may not cross a cell boundary, which is what `container` is for.
+    """
     paragraphs = []
-    for elem in doc.get("body", {}).get("content", []):
-        if "paragraph" not in elem:
-            continue
-        para = elem["paragraph"]
-        style = para.get("paragraphStyle", {}).get("namedStyleType", "NORMAL_TEXT")
-        runs = []
-        full_text = ""
-        for pe in para.get("elements", []):
-            if "textRun" in pe:
-                content = pe["textRun"]["content"]
-                runs.append(TextRun(
-                    text=content,
-                    start=pe["startIndex"],
-                    end=pe["endIndex"],
-                ))
-                full_text += content
-        # Strip trailing newline for display (Google Docs always ends paragraphs with \n)
-        display_text = full_text.rstrip("\n")
-        paragraphs.append(Paragraph(
-            text=display_text,
-            style=style,
-            start=elem["startIndex"],
-            end=elem["endIndex"],
-            runs=runs,
-        ))
+    for elem in content:
+        if "paragraph" in elem:
+            paragraphs.append(_paragraph_from_element(elem, container))
+        elif "table" in elem:
+            table_id = elem.get("startIndex")
+            for row_i, row in enumerate(elem["table"].get("tableRows", [])):
+                for cell_i, cell in enumerate(row.get("tableCells", [])):
+                    cell_id = f"{container or ''}/t{table_id}r{row_i}c{cell_i}"
+                    paragraphs.extend(_extract_from_content(cell.get("content", []), cell_id))
     return paragraphs
 
 
-def _build_full_text_map(paragraphs: list[Paragraph]) -> tuple[str, list[tuple[int, int, int]]]:
+def _extract_paragraphs(doc: dict) -> list[Paragraph]:
+    """
+    Extract paragraphs with full structure from a Docs API response.
+
+    Includes paragraphs inside tables, in document order.
+    """
+    return _extract_from_content(doc.get("body", {}).get("content", []), None)
+
+
+def _build_full_text_map(paragraphs: list[Paragraph]) -> tuple[str, list[tuple[int, int, int, Optional[str]]]]:
     """
     Returns (full_text, text_map) where:
     - full_text is all characters concatenated from all text runs
-    - text_map is list of (offset_in_full_text, doc_start_index, length)
-      allowing mapping from full_text position → document index
+    - text_map is list of (offset_in_full_text, doc_start_index, length, container)
+      allowing mapping from full_text position → document index, and telling
+      which table cell (if any) a position sits in
     """
     parts = []
     text_map = []
     offset = 0
     for para in paragraphs:
         for run in para.runs:
-            text_map.append((offset, run.start, len(run.text)))
+            text_map.append((offset, run.start, len(run.text), para.container))
             parts.append(run.text)
             offset += len(run.text)
     return "".join(parts), text_map
 
 
-def _full_text_pos_to_doc_index(pos: int, text_map: list[tuple[int, int, int]]) -> int:
+def _full_text_pos_to_doc_index(pos: int, text_map: list[tuple[int, int, int, Optional[str]]]) -> int:
     """Map a position in the concatenated full_text to a document character index."""
-    for (ft_offset, doc_start, length) in text_map:
+    for (ft_offset, doc_start, length, _container) in text_map:
         if ft_offset <= pos < ft_offset + length:
             return doc_start + (pos - ft_offset)
+    raise ValueError(f"Position {pos} is not within any text run in the document.")
+
+
+def _container_at(pos: int, text_map: list[tuple[int, int, int, Optional[str]]]) -> Optional[str]:
+    """Return the table cell id containing a full_text position, or None for body text."""
+    for (ft_offset, _doc_start, length, container) in text_map:
+        if ft_offset <= pos < ft_offset + length:
+            return container
     raise ValueError(f"Position {pos} is not within any text run in the document.")
 
 
@@ -743,7 +780,20 @@ def _batch_update(service, doc_id: str, requests: list[dict], revision_id: str):
 
 
 def _doc_range(ft_start: int, ft_end: int, text_map) -> tuple[int, int]:
-    """Map a [start, end) full-text span to a [start, end) document range."""
+    """
+    Map a [start, end) full-text span to a [start, end) document range.
+
+    Rejects a span that starts in one table cell and ends in another. The text
+    map concatenates cell text with nothing between cells, so a search can
+    produce such a span, and editing across a cell boundary is not a legal edit.
+    """
+    start_container = _container_at(ft_start, text_map)
+    end_container = _container_at(ft_end - 1, text_map)
+    if start_container != end_container:
+        raise ValueError(
+            "Match spans a table cell boundary, which cannot be edited as one "
+            "range. Narrow the search text so it falls inside a single cell."
+        )
     return (
         _full_text_pos_to_doc_index(ft_start, text_map),
         _full_text_pos_to_doc_index(ft_end - 1, text_map) + 1,
@@ -847,6 +897,7 @@ def get(doc_id: str) -> dict:
                 "style": p.style,
                 "start": p.start,
                 "end": p.end,
+                "in_table": p.container is not None,
             }
             for p in paragraphs
         ],
@@ -1042,16 +1093,49 @@ def delete_paragraph(doc_id: str, anchor: str) -> dict:
     if not targets:
         raise ValueError(f"No paragraph containing anchor: {anchor!r}")
 
+    # A table cell must keep at least one paragraph: the Docs API will not let
+    # its final paragraph be removed, and sending the request anyway either
+    # fails or damages the table.
+    per_container = {}
+    for p in paragraphs:
+        if p.container is not None:
+            per_container[p.container] = per_container.get(p.container, 0) + 1
+    sole_cell_targets = [
+        t for t in targets
+        if t.container is not None and per_container[t.container] == 1
+    ]
+    if sole_cell_targets:
+        raise ValueError(
+            "Refusing to delete the only paragraph in a table cell, which the "
+            "Docs API does not permit: "
+            + "; ".join(repr(t.text[:60]) for t in sole_cell_targets)
+            + ". Clear the text with search_replace instead."
+        )
+
     # Sort by start index descending so deleting earlier content doesn't shift later indices
     targets.sort(key=lambda p: p.start, reverse=True)
 
+    # The final paragraph of a cell owns the newline that terminates the cell,
+    # and that newline cannot be deleted. For those, remove the preceding
+    # newline and this paragraph's text instead, which leaves the cell intact.
+    last_in_cell = {}
+    for p in paragraphs:
+        if p.container is None:
+            continue
+        current = last_in_cell.get(p.container)
+        if current is None or p.start > current.start:
+            last_in_cell[p.container] = p
+
     requests = []
     for t in targets:
+        start, end = t.start, t.end
+        if t.container is not None and last_in_cell[t.container] is t:
+            start, end = t.start - 1, t.end - 1
         requests.append({
             "deleteContentRange": {
                 "range": {
-                    "startIndex": t.start,
-                    "endIndex": t.end,
+                    "startIndex": start,
+                    "endIndex": end,
                 }
             }
         })
