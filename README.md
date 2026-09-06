@@ -476,12 +476,18 @@ The auth setup requests these scopes:
 | Scope | Purpose |
 |-------|---------|
 | `https://www.googleapis.com/auth/documents` | Read and write Google Docs |
-| `https://www.googleapis.com/auth/drive` | Access Drive files and comments |
-| `https://www.googleapis.com/auth/drive.readonly` | Read Drive file metadata |
-| `https://www.googleapis.com/auth/drive.file` | Per-file Drive access |
-| `https://www.googleapis.com/auth/script.projects` | Create Apps Script projects for comment-path experiments |
-| `https://www.googleapis.com/auth/script.deployments` | Deploy Apps Script functions |
-| `https://www.googleapis.com/auth/script.processes` | View script execution |
+| `https://www.googleapis.com/auth/drive.readonly` | Search and read Drive file metadata (powers `docs_list`) |
+| `https://www.googleapis.com/auth/drive.file` | Per-file Drive access, for comments on files this tool created |
+
+Full `auth/drive` (read/write to every file in your Drive) and the three
+`script.*` scopes are deliberately not requested. The script scopes serve only
+the opt-in bookmark-jump comment bridge and together allow creating and running
+arbitrary code in your Google account.
+
+To add comments to documents this tool did not itself create, add
+`https://www.googleapis.com/auth/drive` back to `SCOPES` in `auth_setup.py` and
+re-run it — the Drive comments API cannot reach arbitrary pre-existing files
+under `drive.file` alone.
 | `openid`, `email`, `profile` | Identity |
 
 ---

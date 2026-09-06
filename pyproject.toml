@@ -18,6 +18,9 @@ dependencies = [
     "fastmcp>=2.0.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
 [project.scripts]
 google-docs-mcp = "server:main"
 google-docs-mcp-auth = "auth_setup:main"
@@ -30,3 +33,6 @@ Repository = "https://github.com/dbuxton/google-docs-mcp"
 
 [tool.setuptools]
 py-modules = ["server", "auth_setup", "docs_edit"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
